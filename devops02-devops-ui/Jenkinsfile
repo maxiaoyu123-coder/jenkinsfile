@@ -1,0 +1,137 @@
+@Library('pipeline-sharelibrary@dev') _
+import org.devops.Constants
+
+//绝对不要与tools块冲突
+def sonar = new org.devops.sonarqube()
+def kit = new org.devops.tools()
+def artifact = new org.devops.artifact()
+def docker = new org.devops.DockerBuild()
+
+pipeline{
+    agent {
+        node {
+            label "master"
+        }
+    }
+    /*parameters{
+        string(description: 'git仓库地址', name:'gitUrl')
+        string(description: '分支', name:'branch')
+        booleanParam(description: '跳过代码扫描', name:'skipScanner')
+        choice(description: '构建工具', name: 'buildType', choices: ['mvn', 'npm', 'gradle', 'go'] )
+     }*/
+    
+
+    environment {
+        SONARQUBE_TOKEN = credentials('sonarqube-root-token')
+        NEXUS_CRED = credentials('nexus-jenkins-password')
+        HARBOR_CRED = credentials('harbor-admin-password')
+        SONARQUBE_CRED = credentials('sonarqube-admin-password')
+        GITLAB_CRED = credentials('gitlab-token')
+        //build tools PATH
+        SONAR_SCANNER_HOME = "/opt/sonar-scanner-4.2.0.1873-linux"
+        PATH = "${SONAR_SCANNER_HOME}/bin:/usr/local/bin:${PATH}"
+        //credentials of the tools
+        //SONARQUBE_TOKEN = credentials('sonarqube-root-token')
+        //SONARQUBE_CRED_ID = 'sonarqube-admin-password' 
+        
+        
+        //['mvn', 'npm', 'gradle', 'go']
+        buildType = 'npm'
+        nexusRepo = "http://192.168.31.102:8081/repository/npm-group/"
+        nexusHostedRepo = "http://192.168.31.102:8081/repository/npm-hosted/"
+        //servers.server.id in settings.xml for authentication to nexus repo
+        mavenRepoId = "maven-hosted"
+        gitlab = "http://192.168.31.102"
+        jobName = GetJobName(JOB_NAME)
+        sonarQualityProfile = "devops"
+        sonarQualityLang = "js"
+        qualityGateName = "devops"
+    }
+    
+    tools{
+        nodejs 'npm'
+        maven 'M3'
+    }
+    
+    stages{
+        stage('checkout'){
+            steps{
+                echo harbor
+                echo "${props["HARBOR"]}"
+                checkout([$class: 'GitSCM', 
+                    branches: [[name: branch]], 
+                    extensions: [], 
+                    userRemoteConfigs: [[credentialsId: 'gitlab-root-password', 
+                    url: gitUrl]]])   
+            }
+        }
+        
+        stage('build'){
+            steps{
+                //此处是否可以根据git webhooker参数判断,自动输入构建类型
+                script{
+                   kit.build(
+                       buildType:buildType,
+                       NPM_GROUP_REPO:Constants.NPM_GROUP_REPO,
+                       NEXUS_CRED_USR:NEXUS_CRED_USR,
+                       NEXUS_CRED_PSW:NEXUS_CRED_USR
+                   ) 
+                }
+            }
+        }
+        
+        stage('scann'){
+            steps{
+                script{
+                    println buildType
+                    println jobName
+                    println sonarQualityProfile
+                    println sonarQualityLang
+                    println qualityGateName
+                    sonar.SonarScan(
+                       sonarQualityLang:sonarQualityLang,
+                       sonarQualityProfile:sonarQualityProfile,
+                       projectName:jobName, 
+                       qualityGateName:qualityGateName
+                    )
+                }
+            }
+        }
+        
+        stage('uploadArtifact'){
+            steps{
+                script{
+                    artifact.upload()
+                }
+            }
+        }
+        stage('dockerImageBuild&Push'){
+            steps{
+                script{
+                    docker.dockerBuildPush()
+                }
+            }            
+        }
+        stage('deployChart'){
+            agent{ label 'k8s' }
+            steps{
+                script{
+                      sh """                 
+                        #判断是否有命名空间，没有则创建
+                        kubectl get ns ${BuName} || kubectl create ns ${BuName}
+                        
+                        #添加repo，安装更新
+                        /usr/local/bin/helm repo add --username admin --password nokia!23 nexus http://192.168.31.102:8081/repository/helm-hosted/
+                        /usr/local/bin/helm repo update
+                        /usr/local/bin/helm upgrade --install ${jobName} -n ${BuName} --set image.tag=${BUILD_ID} nexus/${jobName}
+                      """
+                }
+            }
+        }      
+    }
+    post{
+        success{
+            cleanWs()
+        }
+    }
+}
